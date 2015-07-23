@@ -9,6 +9,8 @@ namespace Drupal\smtp\Plugin\Mail;
 
 use Drupal\Core\Mail\MailInterface;
 use Drupal\smtp\PHPMailer\PHPMailer;
+use Drupal\Core\Mail\MailFormatHelper;
+use Drupal\Component\Utility\Unicode;
 
 /**
  * Modify the drupal mail system to use smtp when sending emails.
@@ -21,8 +23,23 @@ use Drupal\smtp\PHPMailer\PHPMailer;
  * )
  */
 class SMTPMailSystem implements MailInterface {
+
   protected $AllowHtml;
+
+  /**
+   * Config settings for the smtp module.
+   *
+   * @var \Drupal\Core\Config\ImmutableConfig
+   */
   protected $smtpConfig;
+
+  /**
+   * The PHPMailer object.
+   *
+   * @var \Drupal\smtp\PHPMailer\PHPMailer
+   */
+  protected $mailer;
+
 
   /**
    * Constructs a SMPTMailSystem object.
@@ -32,14 +49,7 @@ class SMTPMailSystem implements MailInterface {
   }
 
   /**
-   * Concatenate and wrap the e-mail body for either
-   * plain-text or HTML emails.
-   *
-   * @param $message
-   *   A message array, as described in hook_mail_alter().
-   *
-   * @return
-   *   The formatted $message.
+   * {@inheritdoc}
    */
   public function format(array $message) {
     $this->AllowHtml = $this->smtpConfig->get('smtp_allowhtml');
@@ -47,38 +57,96 @@ class SMTPMailSystem implements MailInterface {
     $message['body'] = implode("\n\n", $message['body']);
     if ($this->AllowHtml == 0) {
       // Convert any HTML to plain-text.
-      $message['body'] = drupal_html_to_text($message['body']);
+      $message['body'] = MailFormatHelper::htmlToText($message['body']);
       // Wrap the mail body for sending.
-      $message['body'] = drupal_wrap_mail($message['body']);
+      $message['body'] = MailFormatHelper::wrapMail($message['body']);
     }
     return $message;
   }
 
   /**
-   * Send the e-mail message.
-   *
-   * @see drupal_mail()
-   *
-   * @param $message
-   *   A message array, as described in hook_mail_alter().
-   * @return
-   *   TRUE if the mail was successfully accepted, otherwise FALSE.
+   * {@inheritdoc}
    */
   public function mail(array $message) {
-    $id = $message['id'];
-    $to = $message['to'];
-    $from = $message['from'];
-    $body = $message['body'];
-    $headers = $message['headers'];
-    $subject = $message['subject'];
+    $this->mailer = new PHPMailer();
+    $this->prepareMailer($message);
 
-    // Create a new PHPMailer object - autoloaded from registry.
-    $mailer = new PHPMailer();
+    return $this->sendMail($message);
+  }
 
-    // Turn on debugging, if requested.
-    if ($this->smtpConfig->get('smtp_debugging') == 1) {
-      $mailer->SMTPDebug = TRUE;
+  /**
+   * @param array $message
+   * @return bool
+   * @throws \Drupal\smtp\Plugin\Exception\PHPMailerException
+   * @throws \Exception
+   */
+  protected function sendMail(array $message) {
+    // Send the email.
+    /*if ($this->smtpConfig->get('smtp_queue')) {
+      watchdog('smtp', 'Queue sending mail to: @to', array('@to' => $to));
+      smtp_send_queue($this->mailerArr);
     }
+    else {*/
+    // Let the people know what is going on.
+    \Drupal::logger('smtp')->info('Sending mail to: @to', array('@to' => $message['to']));
+
+    // Try to send e-mail. If it fails, set watchdog entry.
+    if (!$this->mailer->Send()) {
+      \Drupal::logger('smtp')->error('Error sending e-mail from @from to @to : !error_message', array('@from' => $message['from'], '@to' => $message['to'], '!error_message' => $this->mailer->ErrorInfo));
+      return FALSE;
+    }
+    $this->mailer->SmtpClose();
+    unset($this->mailer);
+    return TRUE;
+    // }
+  }
+
+  /**
+   * Adds values to the mailer.
+   *
+   * @param array $message
+   * @param PHPMailer $this->mailer
+   * @return PHPMailer
+   */
+  protected function prepareMailer(array $message) {
+    $this->setSmtpDebug();
+    $this->setFromMailer($message);
+    $this->setToRecipients($message);
+    $this->processMailerHeadersSettings($message);
+    $this->setSubject($message);
+    // @TODO processMessageBody() should be removed because we have different methods doing
+    // the job at processMailerHeadersSettings()
+    //$this->processMessageBody($message);
+    $this->setAttachments($message);
+    $this->setAuthenticationSettings();
+    $this->setProtocolPrefix();
+    $this->setOtherConnectionSettings();
+  }
+
+  /**
+   * @param array $message
+   */
+  protected function setToRecipients(array $message) {
+    $torecipients = explode(',', $message['to']);
+    foreach ($torecipients as $torecipient) {
+      if (strpos($torecipient, '<') !== FALSE) {
+        $toparts = explode(' <', $torecipient);
+        $toname = $toparts[0];
+        $toaddr = rtrim($toparts[1], '>');
+      }
+      else {
+        $toname = '';
+        $toaddr = $torecipient;
+      }
+      $this->mailer->AddAddress($toaddr, $toname);
+    }
+  }
+
+  /**
+   * @param array $message
+   * @return bool
+   */
+  protected function setFromMailer(array $message) {
 
     // Set the from name.
     $from_name = $this->smtpConfig->get('smtp_fromname');
@@ -90,80 +158,79 @@ class SMTPMailSystem implements MailInterface {
     //Hack to fix reply-to issue.
     $properfrom = $this->smtpConfig->get('site_mail');
     if (!empty($properfrom)) {
-      $headers['From'] = $properfrom;
+      $message['headers']['From'] = $properfrom;
     }
-    if (!isset($headers['Reply-To']) || empty($headers['Reply-To'])) {
-      if (strpos($from, '<')) {
-        $reply = preg_replace('/>.*/', '', preg_replace('/.*</', '', $from));
+    if (!isset($message['headers']['Reply-To']) || empty($message['headers']['Reply-To'])) {
+      if (strpos($message['from'], '<')) {
+        $reply = preg_replace('/>.*/', '', preg_replace('/.*</', '', $message['from']));
       }
       else {
-        $reply = $from;
+        $reply = $message['from'];
       }
-      $headers['Reply-To'] = $reply;
+      $message['headers']['Reply-To'] = $reply;
     }
 
     // Blank value will let the e-mail address appear.
 
-    if ($from == NULL || $from == '') {
+    if ($message['from'] == NULL || $message['from'] == '') {
       // If from e-mail address is blank, use smtp_from config option.
-      if (($from = $this->smtpConfig->get('smtp_from')) == '') {
+      if (($message['from'] = $this->smtpConfig->get('smtp_from')) == '') {
         // If smtp_from config option is blank, use site_email.
-        if (($from = $this->smtpConfig->get('site_mail')) == '') {
+        if (($message['from'] = $this->smtpConfig->get('site_mail')) == '') {
           drupal_set_message(t('There is no submitted from address.'), 'error');
-          watchdog('smtp', 'There is no submitted from address.', array(), WATCHDOG_ERROR);
+          \Drupal::logger('smtp')->error('There is no submitted from address.');
           return FALSE;
         }
       }
     }
-    if (preg_match('/^"?.*"?\s*<.*>$/', $from)) {
+    if (preg_match('/^"?.*"?\s*<.*>$/', $message['from'])) {
       // . == Matches any single character except line break characters \r and \n.
       // * == Repeats the previous item zero or more times.
-      $from_name = preg_replace('/"?([^("\t\n)]*)"?.*$/', '$1', $from); // It gives: Name
-      $from      = preg_replace("/(.*)\<(.*)\>/i", '$2', $from); // It gives: name@domain.tld
+      $from_name = preg_replace('/"?([^("\t\n)]*)"?.*$/', '$1', $message['from']); // It gives: Name
+      $message['from'] = preg_replace("/(.*)\<(.*)\>/i", '$2', $message['from']); // It gives: name@domain.tld
     }
-    elseif (!valid_email_address($from)) {
-      drupal_set_message(t('The submitted from address (@from) is not valid.', array('@from' => $from)), 'error');
-      watchdog('smtp', 'The submitted from address (@from) is not valid.', array('@from' => $from), WATCHDOG_ERROR);
+    elseif (!\Drupal::service('email.validator')->isValid($message['from'])) {
+      drupal_set_message(t('The submitted from address (@from) is not valid.', array('@from' => $message['from'])), 'error');
+      \Drupal::logger('smtp')->error('The submitted from address (@from) is not valid.');
       return FALSE;
     }
 
     // Defines the From value to what we expect.
-    $mailer->From     = $from;
-    $mailer->FromName = $from_name;
-    $mailer->Sender   = $from;
+    $this->mailer->From = $message['from'];
+    $this->mailer->FromName = $from_name;
+    $this->mailer->Sender = $message['from'];
+  }
 
-
-    // Create the list of 'To:' recipients.
-    $torecipients = explode(',', $to);
-    foreach ($torecipients as $torecipient) {
-      if (strpos($torecipient, '<') !== FALSE) {
-        $toparts = explode(' <', $torecipient);
-        $toname = $toparts[0];
-        $toaddr = rtrim($toparts[1], '>');
-      }
-      else {
-        $toname = '';
-        $toaddr = $torecipient;
-      }
-      $mailer->AddAddress($toaddr, $toname);
+  /**
+   *
+   */
+  protected function setSmtpDebug() {
+    // Turn on debugging, if requested.
+    if ($this->smtpConfig->get('smtp_debugging') == 1) {
+      $this->mailer->SMTPDebug = TRUE;
     }
+    else {
+      $this->mailer->SMTPDebug = FALSE;
+    }
+  }
 
+  /**
+   * @param array $message
+   */
+  protected function processMailerHeadersSettings(array $message) {
 
-    // Parse the headers of the message and set the PHPMailer object's settings
-    // accordingly.
-    foreach ($headers as $key => $value) {
-      //watchdog('error', 'Key: ' . $key . ' Value: ' . $value);
+    foreach ($message['headers'] as $key => $value) {
       switch (strtolower($key)) {
         case 'from':
-          if ($from == NULL or $from == '') {
+          if ($message['from'] == NULL or $message['from'] == '') {
             // If a from value was already given, then set based on header.
             // Should be the most common situation since drupal_mail moves the
             // from to headers.
-            $from           = $value;
-            $mailer->From     = $value;
+            $message['from'] = $value;
+            $this->mailer->From = $value;
             // then from can be out of sync with from_name !
-            $mailer->FromName = '';
-            $mailer->Sender   = $value;
+            $this->mailer->FromName = '';
+            $this->mailer->Sender = $value;
           }
           break;
         case 'content-type':
@@ -179,75 +246,85 @@ class SMTPMailSystem implements MailInterface {
             }
           }
           // Set the charset based on the provided value, otherwise set it to UTF-8 (which is Drupals internal default).
-          $mailer->CharSet = isset($vars['charset']) ? $vars['charset'] : 'UTF-8';
+          $this->mailer->CharSet = isset($vars['charset']) ? $vars['charset'] : 'UTF-8';
           // If $vars is empty then set an empty value at index 0 to avoid a PHP warning in the next statement
           $vars[0] = isset($vars[0])?$vars[0]:'';
 
           switch ($vars[0]) {
             case 'text/plain':
               // The message includes only a plain text part.
-              $mailer->IsHTML(FALSE);
-              $content_type = 'text/plain';
+              $this->mailer->IsHTML(FALSE);
+              $this->mailer->ContentType = 'text/plain';
+              $this->processMessageDefaultBody($message);
               break;
+
             case 'text/html':
               // The message includes only an HTML part.
-              $mailer->IsHTML(TRUE);
-              $content_type = 'text/html';
+              $this->mailer->IsHTML(TRUE);
+              $this->mailer->ContentType = 'text/html';
+              $this->processMessageDefaultBody($message);
               break;
+
             case 'multipart/related':
               // Get the boundary ID from the Content-Type header.
               $boundary = $this->_get_substring($value, 'boundary', '"', '"');
 
               // The message includes an HTML part w/inline attachments.
-              $mailer->ContentType = $content_type = 'multipart/related; boundary="' . $boundary . '"';
-            break;
+              $this->mailer->ContentType = 'multipart/related; boundary="' . $boundary . '"';
+              $this->processMessageDefaultBody($message);
+              break;
+
             case 'multipart/alternative':
               // The message includes both a plain text and an HTML part.
-              $mailer->ContentType = $content_type = 'multipart/alternative';
+              $this->mailer->ContentType = $this->mailer->ContentType = 'multipart/alternative';
 
               // Get the boundary ID from the Content-Type header.
               $boundary = $this->_get_substring($value, 'boundary', '"', '"');
-            break;
+              $this->processMessageBodyMultiPartAlternative($message, $boundary);
+              break;
+
             case 'multipart/mixed':
               // The message includes one or more attachments.
-              $mailer->ContentType = $content_type = 'multipart/mixed';
+              $this->mailer->ContentType = $this->mailer->ContentType = 'multipart/mixed';
 
               // Get the boundary ID from the Content-Type header.
               $boundary = $this->_get_substring($value, 'boundary', '"', '"');
-            break;
+              $this->processMessageBodyMultiPartMixed($message, $boundary);
+              break;
+
             default:
               // Everything else is unsuppored by PHPMailer.
               drupal_set_message(t('The %header of your message is not supported by PHPMailer and will be sent as text/plain instead.', array('%header' => "Content-Type: $value")), 'error');
-              watchdog('smtp', 'The %header of your message is not supported by PHPMailer and will be sent as text/plain instead.', array('%header' => "Content-Type: $value"), WATCHDOG_ERROR);
-
+              \Drupal::logger('smtp')->error('The %header of your message is not supported by PHPMailer and will be sent as text/plain instead.', array('%header' => "Content-Type: $value"));
               // Force the Content-Type to be text/plain.
-              $mailer->IsHTML(FALSE);
-              $content_type = 'text/plain';
+              $this->mailer->IsHTML(FALSE);
+              $this->mailer->ContentType = 'text/plain';
+              $this->processMessageDefaultBody($message);
           }
           break;
 
         case 'reply-to':
           // Only add a "reply-to" if it's not the same as "return-path".
-          if ($value != $headers['Return-Path']) {
+          if ($value != $message['headers']['Return-Path']) {
             if (strpos($value, '<') !== FALSE) {
               $replyToParts = explode('<', $value);
               $replyToName = trim($replyToParts[0]);
               $replyToName = trim($replyToName, '"');
               $replyToAddr = rtrim($replyToParts[1], '>');
-              $mailer->AddReplyTo($replyToAddr, $replyToName);
+              $this->mailer->AddReplyTo($replyToAddr, $replyToName);
             }
             else {
-              $mailer->AddReplyTo($value);
+              $this->mailer->AddReplyTo($value);
             }
           }
           break;
 
         case 'content-transfer-encoding':
-          $mailer->Encoding = $value;
+          $this->mailer->Encoding = $value;
           break;
 
         case 'return-path':
-          $mailer->Sender = $value;
+          //$this->mailer->Sender = $value;
           break;
 
         case 'mime-version':
@@ -256,7 +333,7 @@ class SMTPMailSystem implements MailInterface {
           break;
 
         case 'errors-to':
-          $mailer->AddCustomHeader('Errors-To: ' . $value);
+          $this->mailer->AddCustomHeader('Errors-To: ' . $value);
           break;
 
         case 'cc':
@@ -271,7 +348,7 @@ class SMTPMailSystem implements MailInterface {
               $ccname = '';
               $ccaddr = $ccrecipient;
             }
-            $mailer->AddCC($ccaddr, $ccname);
+            $this->mailer->AddCC($ccaddr, $ccname);
           }
           break;
 
@@ -287,65 +364,78 @@ class SMTPMailSystem implements MailInterface {
               $bccname = '';
               $bccaddr = $bccrecipient;
             }
-            $mailer->AddBCC($bccaddr, $bccname);
+            $this->mailer->AddBCC($bccaddr, $bccname);
           }
           break;
 
         default:
           // The header key is not special - add it as is.
-          $mailer->AddCustomHeader($key . ': ' . $value);
+          $this->mailer->AddCustomHeader($key . ': ' . $value);
       }
     }
+  }
 
+  /**
+   * @param array $message
+   */
+  protected function setSubject(array $message) {
+    $this->mailer->Subject = $message['subject'];
+  }
+
+  /**
+   * @param array $message
+   * @param PHPMailer $this->mailer
+   * @return PHPMailer
+   * @throws \Drupal\smtp\Plugin\Exception\PHPMailerException
+   * @throws \Exception
+   */
+  protected function processMessageBody(array $message) {
     /**
      * TODO
      * Need to figure out the following.
      *
      * Add one last header item, but not if it has already been added.
      * $errors_to = FALSE;
-     * foreach ($mailer->CustomHeader as $custom_header) {
+     * foreach ($this->mailer->CustomHeader as $custom_header) {
      *   if ($custom_header[0] = '') {
      *     $errors_to = TRUE;
      *   }
      * }
      * if ($errors_to) {
-     *   $mailer->AddCustomHeader('Errors-To: '. $from);
+     *   $this->mailer->AddCustomHeader('Errors-To: '. $from);
      * }
      */
-    // Add the message's subject.
-    $mailer->Subject = $subject;
+    switch ($this->mailer->ContentType) {
 
-    // Processes the message's body.
-    switch ($content_type) {
       case 'multipart/related':
-        $mailer->Body = $body;
+        $this->mailer->Body = $message['body'];
         // TODO: Figure out if there is anything more to handling this type.
         break;
 
       case 'multipart/alternative':
         // Split the body based on the boundary ID.
-        $body_parts = $this->_boundary_split($body, $boundary);
+        $body_parts = $this->_boundary_split($message['body'], $this->boundary);
         foreach ($body_parts as $body_part) {
-          // If plain/text within the body part, add it to $mailer->AltBody.
+          // If plain/text within the body part, add it to $this->mailer->AltBody.
           if (strpos($body_part, 'text/plain')) {
             // Clean up the text.
             $body_part = trim($this->_remove_headers(trim($body_part)));
             // Include it as part of the mail object.
-            $mailer->AltBody = $body_part;
+            $this->mailer->AltBody = $body_part;
           }
-          // If plain/html within the body part, add it to $mailer->Body.
+          // If plain/html within the body part, add it to $this->mailer->Body.
           elseif (strpos($body_part, 'text/html')) {
             // Clean up the text.
             $body_part = trim($this->_remove_headers(trim($body_part)));
             // Include it as part of the mail object.
-            $mailer->Body = $body_part;
+            $this->mailer->Body = $body_part;
           }
         }
         break;
 
       case 'multipart/mixed':
         // Split the body based on the boundary ID.
-        $body_parts = $this->_boundary_split($body, $boundary);
+        $body_parts = $this->_boundary_split($message['body'], $this->boundary);
 
         // Determine if there is an HTML part for when adding the plain text part.
         $text_plain = FALSE;
@@ -361,7 +451,7 @@ class SMTPMailSystem implements MailInterface {
 
         foreach ($body_parts as $body_part) {
           // If test/plain within the body part, add it to either
-          // $mailer->AltBody or $mailer->Body, depending on whether there is
+          // $this->mailer->AltBody or $this->mailer->Body, depending on whether there is
           // also a text/html part ot not.
           if (strpos($body_part, 'multipart/alternative')) {
             // Get boundary ID from the Content-Type header.
@@ -372,59 +462,59 @@ class SMTPMailSystem implements MailInterface {
             $body_parts2 = $this->_boundary_split($body_part, $boundary2);
 
             foreach ($body_parts2 as $body_part2) {
-              // If plain/text within the body part, add it to $mailer->AltBody.
+              // If plain/text within the body part, add it to $this->mailer->AltBody.
               if (strpos($body_part2, 'text/plain')) {
                 // Clean up the text.
                 $body_part2 = trim($this->_remove_headers(trim($body_part2)));
                 // Include it as part of the mail object.
-                $mailer->AltBody = $body_part2;
-                $mailer->ContentType = 'multipart/mixed';
+                $this->mailer->AltBody = $body_part2;
+                $this->mailer->ContentType = 'multipart/mixed';
               }
-              // If plain/html within the body part, add it to $mailer->Body.
+              // If plain/html within the body part, add it to $this->mailer->Body.
               elseif (strpos($body_part2, 'text/html')) {
                 // Get the encoding.
                 $body_part2_encoding = $this->_get_substring($body_part2, 'Content-Transfer-Encoding', ' ', "\n");
                 // Clean up the text.
                 $body_part2 = trim($this->_remove_headers(trim($body_part2)));
                 // Check whether the encoding is base64, and if so, decode it.
-                if (drupal_strtolower($body_part2_encoding) == 'base64') {
+                if (Unicode::strtolower($body_part2_encoding) == 'base64') {
                   // Include it as part of the mail object.
-                  $mailer->Body = base64_decode($body_part2);
+                  $this->mailer->Body = base64_decode($body_part2);
                   // Ensure the whole message is recoded in the base64 format.
-                  $mailer->Encoding = 'base64';
+                  $this->mailer->Encoding = 'base64';
                 }
                 else {
                   // Include it as part of the mail object.
-                  $mailer->Body = $body_part2;
+                  $this->mailer->Body = $body_part2;
                 }
-                $mailer->ContentType = 'multipart/mixed';
+                $this->mailer->ContentType = 'multipart/mixed';
               }
             }
           }
-          // If text/plain within the body part, add it to $mailer->Body.
+          // If text/plain within the body part, add it to $this->mailer->Body.
           elseif (strpos($body_part, 'text/plain')) {
             // Clean up the text.
             $body_part = trim($this->_remove_headers(trim($body_part)));
 
             if ($text_html) {
-              $mailer->AltBody = $body_part;
-              $mailer->IsHTML(TRUE);
-              $mailer->ContentType = 'multipart/mixed';
+              $this->mailer->AltBody = $body_part;
+              $this->mailer->IsHTML(TRUE);
+              $this->mailer->ContentType = 'multipart/mixed';
             }
             else {
-              $mailer->Body = $body_part;
-              $mailer->IsHTML(FALSE);
-              $mailer->ContentType = 'multipart/mixed';
+              $this->mailer->Body = $body_part;
+              $this->mailer->IsHTML(FALSE);
+              $this->mailer->ContentType = 'multipart/mixed';
             }
           }
-          // If text/html within the body part, add it to $mailer->Body.
+          // If text/html within the body part, add it to $this->mailer->Body.
           elseif (strpos($body_part, 'text/html')) {
             // Clean up the text.
             $body_part = trim($this->_remove_headers(trim($body_part)));
             // Include it as part of the mail object.
-            $mailer->Body = $body_part;
-            $mailer->IsHTML(TRUE);
-            $mailer->ContentType = 'multipart/mixed';
+            $this->mailer->Body = $body_part;
+            $this->mailer->IsHTML(TRUE);
+            $this->mailer->ContentType = 'multipart/mixed';
           }
           // Add the attachment.
           elseif (strpos($body_part, 'Content-Disposition: attachment;') && !isset($message['params']['attachments'])) {
@@ -434,7 +524,7 @@ class SMTPMailSystem implements MailInterface {
             $file_type     = $this->_get_substring($body_part, 'Content-Type', ' ', ';');
 
             if (file_exists($file_path)) {
-              if (!$mailer->AddAttachment($file_path, $file_name, $file_encoding, $file_type)) {
+              if (!$this->mailer->AddAttachment($file_path, $file_name, $file_encoding, $file_type)) {
                 drupal_set_message(t('Attahment could not be found or accessed.'));
               }
             }
@@ -442,21 +532,21 @@ class SMTPMailSystem implements MailInterface {
               // Clean up the text.
               $body_part = trim($this->_remove_headers(trim($body_part)));
 
-              if (drupal_strtolower($file_encoding) == 'base64') {
+              if (Unicode::strtolower($file_encoding) == 'base64') {
                 $attachment = base64_decode($body_part);
               }
-              elseif (drupal_strtolower($file_encoding) == 'quoted-printable') {
+              elseif (Unicode::strtolower($file_encoding) == 'quoted-printable') {
                 $attachment = quoted_printable_decode($body_part);
               }
               else {
                 $attachment = $body_part;
               }
 
-              $attachment_new_filename = drupal_tempnam('temporary://', 'smtp');
+              $attachment_new_filename = \Drupal::service('file_system')->tempnam('temporary://', 'smtp');
               $file_path = file_save_data($attachment, $attachment_new_filename, FILE_EXISTS_REPLACE);
-              $real_path = drupal_realpath($file_path->uri);
+              $real_path = \Drupal::service('file_system')->realpath($file_path->uri);
 
-              if (!$mailer->AddAttachment($real_path, $file_name)) {
+              if (!$this->mailer->AddAttachment($real_path, $file_name)) {
                 drupal_set_message(t('Attachment could not be found or accessed.'));
               }
             }
@@ -465,70 +555,232 @@ class SMTPMailSystem implements MailInterface {
         break;
 
       default:
-        $mailer->Body = $body;
+        $this->mailer->Body = $message['body'];
         break;
     }
+  }
 
-    // Process mimemail attachments, which are prepared in mimemail_mail().
+  /**
+   * @param array $message
+   * @param $boundary
+   */
+  protected function processMessageBodyMultiPartAlternative(array $message, $boundary) {
+    // Split the body based on the boundary ID.
+    $body_parts = $this->_boundary_split($message['body'], $boundary);
+    foreach ($body_parts as $body_part) {
+      // If plain/text within the body part, add it to $this->mailer->AltBody.
+      if (strpos($body_part, 'text/plain')) {
+        // Clean up the text.
+        $body_part = trim($this->_remove_headers(trim($body_part)));
+        // Include it as part of the mail object.
+        $this->mailer->AltBody = $body_part;
+      }
+      // If plain/html within the body part, add it to $this->mailer->Body.
+      elseif (strpos($body_part, 'text/html')) {
+        // Clean up the text.
+        $body_part = trim($this->_remove_headers(trim($body_part)));
+        // Include it as part of the mail object.
+        $this->mailer->Body = $body_part;
+      }
+    }
+  }
+
+  /**
+   * @param array $message
+   * @param $boundary
+   * @throws \Drupal\smtp\Plugin\Exception\PHPMailerException
+   * @throws \Exception
+   */
+  protected function processMessageBodyMultiPartMixed(array $message, $boundary) {
+    // Split the body based on the boundary ID.
+    $body_parts = $this->_boundary_split($message['body'], $boundary);
+
+    // Determine if there is an HTML part for when adding the plain text part.
+    $text_plain = FALSE;
+    $text_html  = FALSE;
+    foreach ($body_parts as $body_part) {
+      if (strpos($body_part, 'text/plain')) {
+        $text_plain = TRUE;
+      }
+      if (strpos($body_part, 'text/html')) {
+        $text_html = TRUE;
+      }
+    }
+
+    foreach ($body_parts as $body_part) {
+      // If test/plain within the body part, add it to either
+      // $this->mailer->AltBody or $this->mailer->Body, depending on whether there is
+      // also a text/html part ot not.
+      if (strpos($body_part, 'multipart/alternative')) {
+        // Get boundary ID from the Content-Type header.
+        $boundary2 = $this->_get_substring($body_part, 'boundary', '"', '"');
+        // Clean up the text.
+        $body_part = trim($this->_remove_headers(trim($body_part)));
+        // Split the body based on the boundary ID.
+        $body_parts2 = $this->_boundary_split($body_part, $boundary2);
+
+        foreach ($body_parts2 as $body_part2) {
+          // If plain/text within the body part, add it to $this->mailer->AltBody.
+          if (strpos($body_part2, 'text/plain')) {
+            // Clean up the text.
+            $body_part2 = trim($this->_remove_headers(trim($body_part2)));
+            // Include it as part of the mail object.
+            $this->mailer->AltBody = $body_part2;
+            $this->mailer->ContentType = 'multipart/mixed';
+          }
+          // If plain/html within the body part, add it to $this->mailer->Body.
+          elseif (strpos($body_part2, 'text/html')) {
+            // Get the encoding.
+            $body_part2_encoding = $this->_get_substring($body_part2, 'Content-Transfer-Encoding', ' ', "\n");
+            // Clean up the text.
+            $body_part2 = trim($this->_remove_headers(trim($body_part2)));
+            // Check whether the encoding is base64, and if so, decode it.
+            if (Unicode::strtolower($body_part2_encoding) == 'base64') {
+              // Include it as part of the mail object.
+              $this->mailer->Body = base64_decode($body_part2);
+              // Ensure the whole message is recoded in the base64 format.
+              $this->mailer->Encoding = 'base64';
+            }
+            else {
+              // Include it as part of the mail object.
+              $this->mailer->Body = $body_part2;
+            }
+            $this->mailer->ContentType = 'multipart/mixed';
+          }
+        }
+      }
+      // If text/plain within the body part, add it to $this->mailer->Body.
+      elseif (strpos($body_part, 'text/plain')) {
+        // Clean up the text.
+        $body_part = trim($this->_remove_headers(trim($body_part)));
+
+        if ($text_html) {
+          $this->mailer->AltBody = $body_part;
+          $this->mailer->IsHTML(TRUE);
+          $this->mailer->ContentType = 'multipart/mixed';
+        }
+        else {
+          $this->mailer->Body = $body_part;
+          $this->mailer->IsHTML(FALSE);
+          $this->mailer->ContentType = 'multipart/mixed';
+        }
+      }
+      // If text/html within the body part, add it to $this->mailer->Body.
+      elseif (strpos($body_part, 'text/html')) {
+        // Clean up the text.
+        $body_part = trim($this->_remove_headers(trim($body_part)));
+        // Include it as part of the mail object.
+        $this->mailer->Body = $body_part;
+        $this->mailer->IsHTML(TRUE);
+        $this->mailer->ContentType = 'multipart/mixed';
+      }
+      // Add the attachment.
+      elseif (strpos($body_part, 'Content-Disposition: attachment;') && !isset($message['params']['attachments'])) {
+        $file_path     = $this->_get_substring($body_part, 'filename=', '"', '"');
+        $file_name     = $this->_get_substring($body_part, ' name=', '"', '"');
+        $file_encoding = $this->_get_substring($body_part, 'Content-Transfer-Encoding', ' ', "\n");
+        $file_type     = $this->_get_substring($body_part, 'Content-Type', ' ', ';');
+
+        if (file_exists($file_path)) {
+          if (!$this->mailer->AddAttachment($file_path, $file_name, $file_encoding, $file_type)) {
+            drupal_set_message(t('Attahment could not be found or accessed.'));
+          }
+        }
+        else {
+          // Clean up the text.
+          $body_part = trim($this->_remove_headers(trim($body_part)));
+
+          if (Unicode::strtolower($file_encoding) == 'base64') {
+            $attachment = base64_decode($body_part);
+          }
+          elseif (Unicode::strtolower($file_encoding) == 'quoted-printable') {
+            $attachment = quoted_printable_decode($body_part);
+          }
+          else {
+            $attachment = $body_part;
+          }
+
+          $attachment_new_filename = \Drupal::service('file_system')->tempnam('temporary://', 'smtp');
+          $file_path = file_save_data($attachment, $attachment_new_filename, FILE_EXISTS_REPLACE);
+          $real_path = \Drupal::service('file_system')->realpath($file_path->uri);
+
+          if (!$this->mailer->AddAttachment($real_path, $file_name)) {
+            drupal_set_message(t('Attachment could not be found or accessed.'));
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * @param array $message
+   */
+  protected function processMessageDefaultBody(array $message) {
+    $this->mailer->Body = $message['body'];
+  }
+
+  /**
+   * @param array $message
+   * @param PHPMailer $this->mailer
+   * @return PHPMailer
+   * @throws \Drupal\smtp\Plugin\Exception\PHPMailerException
+   * @throws \Exception
+   */
+  protected function setAttachments(array $message) {
     if (isset($message['params']['attachments'])) {
       foreach ($message['params']['attachments'] as $attachment) {
         if (isset($attachment['filecontent'])) {
-          $mailer->AddStringAttachment($attachment['filecontent'], $attachment['filename'], 'base64', $attachment['filemime']);
+          $this->mailer->AddStringAttachment($attachment['filecontent'], $attachment['filename'], 'base64', $attachment['filemime']);
         }
         if (isset($attachment['filepath'])) {
           $filename = isset($attachment['filename']) ? $attachment['filename'] : basename($attachment['filepath']);
           $filemime = isset($attachment['filemime']) ? $attachment['filemime'] : file_get_mimetype($attachment['filepath']);
-          $mailer->AddAttachment($attachment['filepath'], $filename, 'base64', $filemime);
+          $this->mailer->AddAttachment($attachment['filepath'], $filename, 'base64', $filemime);
         }
       }
     }
+  }
 
-    // Set the authentication settings.
+  /**
+   * @param PHPMailer $this->mailer
+   */
+  protected function setProtocolPrefix() {
+    switch ($this->smtpConfig->get('smtp_protocol')) {
+      case 'ssl':
+        $this->mailer->SMTPSecure = 'ssl';
+        break;
+
+      case 'tls':
+        $this->mailer->SMTPSecure = 'tls';
+        break;
+
+      default:
+        $this->mailer->SMTPSecure = '';
+    }
+  }
+
+  /**
+   * Sets the authentication settings.
+   */
+  protected function setAuthenticationSettings() {
     $username = $this->smtpConfig->get('smtp_username');
     $password = $this->smtpConfig->get('smtp_password');
 
     // If username and password are given, use SMTP authentication.
     if ($username != '' && $password != '') {
-      $mailer->SMTPAuth = TRUE;
-      $mailer->Username = $username;
-      $mailer->Password = $password;
+      $this->mailer->SMTPAuth = TRUE;
+      $this->mailer->Username = $username;
+      $this->mailer->Password = $password;
     }
+  }
 
-
-    // Set the protocol prefix for the smtp host.
-    switch ($this->smtpConfig->get('smtp_protocol')) {
-      case 'ssl':
-        $mailer->SMTPSecure = 'ssl';
-        break;
-
-      case 'tls':
-        $mailer->SMTPSecure = 'tls';
-        break;
-
-      default:
-        $mailer->SMTPSecure = '';
-    }
-
-
-    // Set other connection settings.
-    $mailer->Host = $this->smtpConfig->get('smtp_host') . ';' . $this->smtpConfig->get('smtp_hostbackup');
-    $mailer->Port = $this->smtpConfig->get('smtp_port');
-    $mailer->Mailer = 'smtp';
-
-    $mailerArr = array(
-      'mailer' => $mailer,
-      'to' => $to,
-      'from' => $from,
-    );
-    if ($this->smtpConfig->get('smtp_queue')) {
-      watchdog('smtp', 'Queue sending mail to: @to', array('@to' => $to));
-      smtp_send_queue($mailerArr);
-    }
-    else {
-      return _smtp_mailer_send($mailerArr);
-    }
-
-    return TRUE;
+  /**
+   * Sets other connection settings.
+   */
+  protected function setOtherConnectionSettings() {
+    $this->mailer->Host = $this->smtpConfig->get('smtp_host') . ';' . $this->smtpConfig->get('smtp_hostbackup');
+    $this->mailer->Port = $this->smtpConfig->get('smtp_port');
+    $this->mailer->Mailer = 'smtp';
   }
 
   /**
@@ -537,15 +789,12 @@ class SMTPMailSystem implements MailInterface {
    * Swiped from Mail::MimeDecode, with modifications based on Drupal's coding
    * standards and this bug report: http://pear.php.net/bugs/bug.php?id=6495
    *
-   * @param input
-   *   A string containing the body text to parse.
-   * @param boundary
-   *   A string with the boundary string to parse on.
-   * @return
-   *   An array containing the resulting mime parts
+   * @param $input
+   * @param $boundary
+   * @return array
    */
   protected function _boundary_split($input, $boundary) {
-    $parts       = array();
+    $parts = array();
     $bs_possible = substr($boundary, 2, -2);
     $bs_check    = '\"' . $bs_possible . '\"';
 
@@ -562,22 +811,23 @@ class SMTPMailSystem implements MailInterface {
     }
 
     return $parts;
-  }  //  End of _smtp_boundary_split().
+  }
 
   /**
    * Strips the headers from the body part.
    *
-   * @param input
+   * @param $input
    *   A string containing the body part to strip.
-   * @return
+   *
+   * @return string
    *   A string with the stripped body part.
    */
   protected function _remove_headers($input) {
     $part_array = explode("\n", $input);
 
     // will strip these headers according to RFC2045
-    $headers_to_strip = array( 'Content-Type', 'Content-Transfer-Encoding', 'Content-ID', 'Content-Disposition');
-    $pattern = '/^(' . implode('|', $headers_to_strip) . '):/';
+    $this->headers_to_strip = array( 'Content-Type', 'Content-Transfer-Encoding', 'Content-ID', 'Content-Disposition');
+    $pattern = '/^(' . implode('|', $this->headers_to_strip) . '):/';
 
     while (count($part_array) > 0) {
 
@@ -603,25 +853,14 @@ class SMTPMailSystem implements MailInterface {
 
     $output = implode("\n", $part_array);
     return $output;
-  }  //  End of _smtp_remove_headers().
+  }
 
   /**
-   * Returns a string that is contained within another string.
-   *
-   * Returns the string from within $source that is some where after $target
-   * and is between $beginning_character and $ending_character.
-   *
    * @param $source
-   *   A string containing the text to look through.
    * @param $target
-   *   A string containing the text in $source to start looking from.
    * @param $beginning_character
-   *   A string containing the character just before the sought after text.
    * @param $ending_character
-   *   A string containing the character just after the sought after text.
-   * @return
-   *   A string with the text found between the $beginning_character and the
-   *   $ending_character.
+   * @return string
    */
   protected function _get_substring($source, $target, $beginning_character, $ending_character) {
     $search_start     = strpos($source, $target) + 1;
